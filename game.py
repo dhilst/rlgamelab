@@ -1,30 +1,19 @@
 import ale_py
 import shimmy
 
+import torch
 import gymnasium as gym
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, SubprocVecEnv
 from stable_baselines3.common.atari_wrappers import AtariWrapper
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.env_util import make_vec_env # Import make_vec_env
 import argparse
 import cv2
 import numpy as np
 import datetime
-import os # Import the os module for path operations
+import os
 
-
-def make_env(render_mode=None):
-    """
-    Creates a single Atari Pong environment.
-    Args:
-        render_mode (str, optional): The render mode for the environment (e.g., "human", "rgb_array").
-                                     Defaults to None, meaning no rendering unless explicitly specified.
-    Returns:
-        gym.Env: The wrapped Atari Pong environment.
-    """
-    env = gym.make("ALE/Pong-v5", render_mode=render_mode)
-    env = AtariWrapper(env) # This wrapper affects observations, not necessarily render() output directly
-    return env
 
 
 class EpisodeRenderCallback(BaseCallback):
@@ -35,7 +24,7 @@ class EpisodeRenderCallback(BaseCallback):
     Set render_every_n_episodes=0 to disable rendering.
     """
     def __init__(self, render_every_n_episodes: int = 100, render_speed_factor: int = 10,
-                 display_scale_factor: int = 4, verbose: int = 1):
+                 display_scale_factor: int = 4, verbose: int = 1, n_stack: int = 4):
         super().__init__(verbose)
         self.render_every_n_episodes = render_every_n_episodes
         self.render_speed_factor = max(1, render_speed_factor) # Ensure it's at least 1
@@ -44,7 +33,7 @@ class EpisodeRenderCallback(BaseCallback):
         self.render_env = None  # Dedicated environment for rendering
         self.window_name = "Pong Accelerated Render" # Name for the OpenCV window
         self.agent_view_shape = (84, 84, 3) # The shape the agent sees (after AtariWrapper)
-
+        self.n_stack = n_stack # Store n_stack to pass to make_vec_env
 
     def _on_training_start(self) -> None:
         """
@@ -54,9 +43,18 @@ class EpisodeRenderCallback(BaseCallback):
         """
         if self.render_every_n_episodes > 0:
             print("Creating dedicated rendering environment...")
-            single_base_env = make_env(render_mode="rgb_array")
-            # For the rendering environment, DummyVecEnv is fine as it's a single instance
-            self.render_env = VecFrameStack(DummyVecEnv([lambda: single_base_env]), n_stack=4)
+            # Use make_vec_env for the rendering environment as well
+            # n_envs=1 for a single rendering environment
+            # vec_env_cls=DummyVecEnv is appropriate for a single env
+            self.render_env = make_vec_env(
+                env_id="ALE/Pong-v5",
+                n_envs=1,
+                seed=0, # Use a fixed seed for consistent rendering
+                vec_env_cls=DummyVecEnv,
+                wrapper_class=AtariWrapper,
+                env_kwargs={"render_mode": "rgb_array"}, # Pass render_mode to gym.make
+                # frame_stack=self.n_stack # Apply frame stacking
+            )
             print(f"Dedicated rendering environment created and frame stacked (using rgb_array).")
             print(f"Render speed factor: {self.render_speed_factor}x, Display scale factor: {self.display_scale_factor}x.")
             cv2.namedWindow(self.window_name, cv2.WINDOW_AUTOSIZE)
@@ -76,16 +74,25 @@ class EpisodeRenderCallback(BaseCallback):
         """
         Called at each training step. Checks if an episode has ended
         and triggers rendering if it's the right interval.
+        Also prints individual episode rewards.
         """
         if self.render_every_n_episodes <= 0:
             return True
 
-        if self.locals.get("dones") is None:
+        if self.locals.get("dones") is None or self.locals.get("infos") is None:
             return True
 
-        for done in self.locals["dones"]:
+        for i, done in enumerate(self.locals["dones"]):
             if done:
                 self.episode_counter += 1
+                info = self.locals["infos"][i]
+                # Check if the 'episode' key exists in the info dict
+                # This key is added by VecEnv wrappers for completed episodes
+                if "episode" in info:
+                    episode_reward = info["episode"]["r"]
+                    episode_length = info["episode"]["l"]
+                    print(f"Episode {self.episode_counter} (Env {i}) Finished: Reward={episode_reward:.2f}, Length={episode_length}")
+
                 if self.episode_counter % self.render_every_n_episodes == 0:
                     print(f"\n🎮 Rendering episode {self.episode_counter} using OpenCV...")
                     self._render_episode()
@@ -101,6 +108,7 @@ class EpisodeRenderCallback(BaseCallback):
             print("Warning: render_env not initialized. Cannot render episode.")
             return
 
+        # self.render_env.reset() returns (observation, info) tuple for VecEnvs in Gymnasium style
         obs = self.render_env.reset()
         done = False
         total_reward = 0
@@ -114,7 +122,10 @@ class EpisodeRenderCallback(BaseCallback):
             frame_counter += 1
             if frame_counter % self.render_speed_factor == 0:
                 # Get the RAW RGB array from the environment (will typically be 210, 160, 3)
-                frame = self.render_env.render()
+                frame = self.render_env.render() # Returns a batch of images (n_envs, H, W, C)
+
+                # Since render_env is n_envs=1, take the first (and only) frame
+                # frame = frame[0]
 
                 assert isinstance(frame, np.ndarray), \
                     f"Expected frame to be a numpy array, but got {type(frame)}"
@@ -158,7 +169,7 @@ class EpisodeRenderCallback(BaseCallback):
                     print("Rendering stopped by user (pressed 'q').")
                     done = True
 
-            if done_array[0]:
+            if done_array[0]: # Check done_array for the single environment
                 done = True
 
         # Ensure final frame is rendered if not already (and if not quit by user)
@@ -166,7 +177,8 @@ class EpisodeRenderCallback(BaseCallback):
              try:
                  final_frame = self.render_env.render()
                  raw_game_shape = (210, 160, 3)
-                 if isinstance(final_frame, np.ndarray) and final_frame.shape == raw_game_shape:
+                 if isinstance(final_frame, np.ndarray) and final_frame.shape == (1, *raw_game_shape): # Check for batch dimension
+                     final_frame = final_frame[0] # Extract the single frame
                      final_agent_view_frame = cv2.resize(final_frame,
                                                          (self.agent_view_shape[1], self.agent_view_shape[0]),
                                                          interpolation=cv2.INTER_NEAREST)
@@ -186,14 +198,37 @@ class EpisodeRenderCallback(BaseCallback):
 
         print(f"Episode Rendered. Total Reward: {total_reward}")
 
+    def _on_rollout_end(self) -> None:
+        print(f"DEBUG: _on_rollout_end called at {self.num_timesteps} timesteps, {self.model.ep_info_buffer}.") # Added debug print
+        """
+        Called after each collection of experience (rollout).
+        This is where the model has fresh episode statistics.
+        We'll print the mean reward from recently completed episodes.
+        """
+        # The model's ep_info_buffer holds info for episodes completed during the last rollout
+        # It's a deque, so len(self.model.ep_info_buffer) gives the number of recent episodes
+        assert(self.model.ep_info_buffer is not None)
+        if len(self.model.ep_info_buffer) > 0:
+            mean_reward = np.mean([ep_info["r"] for ep_info in self.model.ep_info_buffer])
+            mean_length = np.mean([ep_info["l"] for ep_info in self.model.ep_info_buffer])
+            print(f"\n--- Rollout Summary ({len(self.model.ep_info_buffer)} episodes) --- Mean Reward: {mean_reward:.2f}, Mean Length: {mean_length:.1f}")
+            # The SB3 internal logger also records these to TensorBoard, so you don't
+            # necessarily need to call self.logger.record here again unless you
+            # want to customize the logging frequency or tag names.
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a PPO agent on Pong-v5.")
     parser.add_argument("--timesteps", type=int, default=100000,
                         help="Total number of timesteps to train the model.")
-    # Changed to --num-envs and default to os.cpu_count()
-    parser.add_argument("--num-envs", type=int, default=os.cpu_count(),
+    parser.add_argument("--n-stack", type=int, default=4,
+                        help="Number of frames to stack for the observation (default: 4).")
+    parser.add_argument("--num-envs", type=int, default=os.cpu_count() or 4,
                         help="Number of parallel environments for vectorized training (defaults to number of CPU cores).")
+    parser.add_argument("--learning-rate", type=float, default=0.00025, # Changed default to SB3's PPO default
+                        help="Learning rate for the optimizer (default: 0.00025).")
+    parser.add_argument("--n-steps", type=int, default=4096, # Changed default to a more common Atari value
+                        help="Number of steps (timesteps) to run for each environment per update rollout (default: 4096).")
     parser.add_argument("--render-every", type=int, default=1,
                         help="Render one episode every N episodes (0 to disable).")
     parser.add_argument("--render-speed", type=int, default=10,
@@ -202,6 +237,10 @@ if __name__ == "__main__":
                         help="Scale up the 84x84 rendered image for better visibility (e.g., 4 means 4x magnification). Default is 4.")
     parser.add_argument("--model-path", type=str, default="weights/",
                         help="Path to the directory for saving/loading model weights. Default is 'weights/'.")
+    parser.add_argument("--tb-log-dir", type=str, default="tensorboard_logs",
+                        help="Path to the directory for TensorBoard logs. Default is 'tensorboard_logs/'.")
+    parser.add_argument("--device", type=str, default="cpu",
+                        help="The device to use for training the model")
     args = parser.parse_args()
 
     current_time = datetime.datetime.now().strftime("%A, %B %d, %Y at %I:%M:%S %p %Z")
@@ -213,34 +252,47 @@ if __name__ == "__main__":
     model_file_name = "ppo_pong_model.zip"
     model_file_path = os.path.join(model_dir, model_file_name)
 
-    # --- Create Vectorized Training Environment (Using SubprocVecEnv for parallelization) ---
-    print(f"Creating {args.num_envs} vectorized environments for training using SubprocVecEnv...")
-    train_env = SubprocVecEnv([lambda: make_env() for _ in range(args.num_envs)])
-    train_env = VecFrameStack(train_env, n_stack=4)
+    # --- Create Vectorized Training Environment (Using make_vec_env for parallelization) ---
+    print(f"Creating {args.num_envs} vectorized environments for training using make_vec_env...")
+    # Using make_vec_env simplifies the creation of multiple environments with wrappers and frame stacking
+    train_env = make_vec_env(
+        env_id="ALE/Pong-v5",
+        n_envs=args.num_envs,
+        seed=0, # Fixed seed for reproducibility
+        vec_env_cls=SubprocVecEnv, # Use SubprocVecEnv for parallelization
+        wrapper_class=AtariWrapper, # Apply AtariWrapper to each environment
+    )
     print("Vectorized training environment created and frame stacked.")
 
     # --- Instantiate the EpisodeRenderCallback ---
     callback = EpisodeRenderCallback(
         render_every_n_episodes=args.render_every,
         render_speed_factor=args.render_speed,
-        display_scale_factor=args.display_scale
+        display_scale_factor=args.display_scale,
+        n_stack=args.n_stack, # Pass n_stack to callback so it can configure its render_env correctly
     )
 
     # --- Load or Create Model ---
     model = None
     if os.path.exists(model_file_path):
         print(f"Loading existing model from {model_file_path}...")
-        model = PPO.load(model_file_path, env=train_env)
+        # Make sure n_steps, learning_rate, n_stack match the loaded model's config if not specified in load
+        model = PPO.load(model_file_path, env=train_env, device=args.device,
+                         n_steps=args.n_steps, tensorboard_log=args.tb_log_dir, learning_rate=args.learning_rate)
         print("Model loaded successfully. Resuming training.")
     else:
         print(f"No existing model found at {model_file_path}. Creating a new model...")
-        model = PPO("CnnPolicy", train_env, verbose=1)
+        model = PPO("CnnPolicy", train_env, verbose=1, device=args.device,
+                    n_steps=args.n_steps, tensorboard_log=args.tb_log_dir, learning_rate=args.learning_rate)
         print("New model created.")
 
     # --- Start Training ---
     print(f"Starting PPO training for {args.timesteps} timesteps...")
     try:
-        model.learn(total_timesteps=args.timesteps, callback=callback)
+        if args.render_every > 0:
+            model.learn(total_timesteps=args.timesteps, callback=callback)
+        else:
+            model.learn(total_timesteps=args.timesteps)
         print("Training finished successfully.")
         model.save(model_file_path)
         print(f"Final model saved to: {model_file_path}")
@@ -249,8 +301,6 @@ if __name__ == "__main__":
         model.save(model_file_path)
         print(f"Model saved to: {model_file_path}")
     finally:
-        # Ensure the training environment is closed,
-        # and gracefully handle EOFError that can occur during KeyboardInterrupt with SubprocVecEnv
         if train_env is not None:
             try:
                 train_env.close()
