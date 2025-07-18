@@ -1,0 +1,15 @@
+[project]
+name = "rl-atari-ppo"
+version = "0.1.0"
+description = "Train PPO on an Atari game using Gymnasium and Stable-Baselines3"
+authors = [{ name = "Your Name", email = "you@example.com" }]
+requires-python = ">=3.12"
+
+dependencies = [
+    "gymnasium[atari,accept-rom-license]>=0.29.1",
+    "opencv-python>=4.12.0.88",
+    "shimmy>=2.0.0",
+    "stable-baselines3>=2.0.0",
+    "tensorboard>=2.20.0",
+    "torch", # optional: pin to a specific version or GPU variant
+]
