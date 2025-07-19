@@ -1,6 +1,9 @@
 import ale_py
 import shimmy
 
+from typing import Literal
+import datetime
+
 import time
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
@@ -21,9 +24,15 @@ class EpisodeRenderCallback(BaseCallback):
     The displayed image can be scaled by 'display_scale_factor'.
     Set render_every_n_episodes=0 to disable rendering.
     """
-    def __init__(self, env_id: str, verbose: int = 1):
+    def __init__(self, env_id: str, verbose: int = 1,
+                 render_mode: Literal["rgb_array", "human"]="rgb_array",
+                 fps: int = 60,
+                 frame_skip = 4):
         super().__init__(verbose)
         self.env_id = env_id # Store env_id
+        self.render_mode = render_mode
+        self.fps = fps
+        self.frame_skip = 4
 
     def _on_training_start(self) -> None:
         """
@@ -38,9 +47,9 @@ class EpisodeRenderCallback(BaseCallback):
             seed=0,
             vec_env_cls=DummyVecEnv,
             wrapper_class=AtariWrapper,
-            env_kwargs={"render_mode": "human"} # , "frameskip": 1},
+            env_kwargs={"render_mode": self.render_mode,
+                        "frameskip": self.frame_skip} # , "frameskip": 1},
         )
-        self.render_env.metadata["render_fps"] = 10
         print(f"Dedicated rendering environment created for {self.env_id} and frame stacked (using rgb_array).")
 
     def _on_training_end(self) -> None:
@@ -76,12 +85,18 @@ class EpisodeRenderCallback(BaseCallback):
             obs, reward, done, _info = self.render_env.step(action)
             total_reward += reward[0]
 
-            self.render_env.render()
+            # frame is none when render_method is rgb_array
+            if (frame := self.render_env.render()) is not None:
+                cv2.imshow("Game", cv2.resize(frame, (512, 512)))
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                print("Rendering stopped by user (pressed 'q').")
-                done = True
+                # 4 frame skip
+                sleep_time = self.frame_skip / self.fps
+                time.sleep(sleep_time)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    print("Rendering stopped by user (pressed 'q').")
+                    done = True
 
 
         print(f"Episode Rendered. Total Reward: {total_reward}")
@@ -114,6 +129,12 @@ if __name__ == "__main__":
                         help="Path to the directory for TensorBoard logs. Default is 'tensorboard_logs/'.")
     parser.add_argument("--device", type=str, default="cpu",
                         help="The device to use for training the model")
+    parser.add_argument("--render-mode", type=str, choices="human rgb_array".split(), default="rgb_array",
+                        help="Render mode")
+    parser.add_argument("--fps", type=int, default=60,
+                        help="Render mode")
+    parser.add_argument("--frame-skip", type=int, default=4,
+                        help="Setup the frameskip for the ALE envrionment")
     args = parser.parse_args()
 
     current_time = datetime.datetime.now().strftime("%A, %B %d, %Y at %I:%M:%S %p %Z")
@@ -142,6 +163,9 @@ if __name__ == "__main__":
     callback = EpisodeRenderCallback(
         env_id=args.env_id,
         verbose=int(args.verbose),
+        render_mode=args.render_mode,
+        fps=args.fps,
+        frame_skip=args.frame_skip,
     )
 
     # --- Load or Create Model ---
