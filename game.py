@@ -1,7 +1,8 @@
 import ale_py
 import shimmy
 
-from typing import Literal
+import sys
+from typing import Final, Literal, ClassVar
 import datetime
 
 import time
@@ -15,6 +16,48 @@ import cv2
 import numpy as np
 import datetime
 import os
+
+def make_env(env_id, n_envs=1, render_mode: Literal["human", "rgb_array"] | None ="human", frame_skip=4, vec_env_cls: type[DummyVecEnv] | type[SubprocVecEnv] | None = DummyVecEnv):
+    return make_vec_env(
+        env_id=env_id,
+        n_envs=n_envs,
+        seed=0,
+        vec_env_cls=vec_env_cls,
+        wrapper_class=AtariWrapper,
+        env_kwargs={"render_mode": render_mode,
+                    "frameskip": frame_skip} # , "frameskip": 1},
+    )
+
+def render_episode(render_env, model, frame_skip = 4, fps = 60):
+    if render_env is None:
+        print("Warning: render_env not initialized. Cannot render episode.")
+        return
+
+    obs = render_env.reset()
+    done = False
+    total_reward = 0
+
+    while not done:
+        action, _states = model.predict(obs, deterministic=True) # type: ignore
+        obs, reward, done, _info = render_env.step(action)
+        total_reward += reward[0]
+
+        # frame is none when render_method is rgb_array
+        if (frame := render_env.render()) is not None:
+            cv2.imshow("Game", cv2.resize(frame, (512, 512)))
+
+            # 4 frame skip
+            sleep_time = frame_skip / fps
+            time.sleep(sleep_time)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("Rendering stopped by user (pressed 'q').")
+                done = True
+
+
+    print(f"Episode Rendered. Total Reward: {total_reward}")
+
 
 
 class EpisodeRenderCallback(BaseCallback):
@@ -30,7 +73,7 @@ class EpisodeRenderCallback(BaseCallback):
                  frame_skip = 4):
         super().__init__(verbose)
         self.env_id = env_id # Store env_id
-        self.render_mode = render_mode
+        self.render_mode: Final = render_mode
         self.fps = fps
         self.frame_skip = 4
 
@@ -41,14 +84,12 @@ class EpisodeRenderCallback(BaseCallback):
         This environment is also frame-stacked to match the model's input expectations.
         """
         print("Creating dedicated rendering environment...")
-        self.render_env = make_vec_env(
+        self.render_env = make_env(
             env_id=self.env_id,
             n_envs=1,
-            seed=0,
             vec_env_cls=DummyVecEnv,
-            wrapper_class=AtariWrapper,
-            env_kwargs={"render_mode": self.render_mode,
-                        "frameskip": self.frame_skip} # , "frameskip": 1},
+            render_mode=self.render_mode,
+            frame_skip=self.frame_skip,
         )
         print(f"Dedicated rendering environment created for {self.env_id} and frame stacked (using rgb_array).")
 
@@ -75,31 +116,8 @@ class EpisodeRenderCallback(BaseCallback):
         if self.render_env is None:
             print("Warning: render_env not initialized. Cannot render episode.")
             return
-
-        obs = self.render_env.reset()
-        done = False
-        total_reward = 0
-
-        while not done:
-            action, _states = self.model.predict(obs, deterministic=True) # type: ignore
-            obs, reward, done, _info = self.render_env.step(action)
-            total_reward += reward[0]
-
-            # frame is none when render_method is rgb_array
-            if (frame := self.render_env.render()) is not None:
-                cv2.imshow("Game", cv2.resize(frame, (512, 512)))
-
-                # 4 frame skip
-                sleep_time = self.frame_skip / self.fps
-                time.sleep(sleep_time)
-
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    print("Rendering stopped by user (pressed 'q').")
-                    done = True
-
-
-        print(f"Episode Rendered. Total Reward: {total_reward}")
+        
+        return render_episode(self.render_env, self.model, self.frame_skip, self.fps)
 
     def _on_rollout_end(self) -> None:
         """
@@ -109,8 +127,11 @@ class EpisodeRenderCallback(BaseCallback):
         """
         self._render_episode()
 
-if __name__ == "__main__":
+
+def main() -> int:
     parser = argparse.ArgumentParser(description="Train a PPO agent on an Atari environment.")
+    parser.add_argument("--eval", action="store_true", default=False,
+                        help="Run the model")
     parser.add_argument("--env-id", type=str, default="ALE/Pong-v5",
                         help="The ID of the Gymnasium environment to train on (e.g., 'ALE/Pong-v5', 'ALE/Breakout-v5').")
     parser.add_argument("--n-steps", type=int, default=2048,
@@ -149,14 +170,26 @@ if __name__ == "__main__":
     model_file_name = f"ppo_{env_name_for_filename}_model.zip"
     model_file_path = os.path.join(model_dir, model_file_name)
 
+    if args.eval:
+        try:
+            env = make_env(args.env_id, render_mode=args.render_mode,
+                           frame_skip=args.frame_skip)
+            model = PPO.load(model_file_path, env=env, device=args.device,
+                             n_steps=args.n_steps, tensorboard_log=args.tb_log_dir, learning_rate=args.learning_rate)
+            print(f"Rendering an episode")
+            render_episode(env, model)
+        except KeyboardInterrupt:
+            pass
+        return 0
+
+
     # --- Create Vectorized Training Environment (Using make_vec_env for parallelization) ---
     print(f"Creating {args.num_envs} vectorized environments for training using make_vec_env...")
-    train_env = make_vec_env(
+    train_env = make_env(
         env_id=args.env_id,
         n_envs=args.num_envs,
-        seed=0,
         vec_env_cls=SubprocVecEnv,
-        wrapper_class=AtariWrapper,
+        render_mode=None,
     )
 
     print("Vectorized training environment created and frame stacked.")
@@ -200,8 +233,15 @@ if __name__ == "__main__":
             except EOFError:
                 print("EOFError encountered while closing SubprocVecEnv. This can happen during an abrupt KeyboardInterrupt.")
                 print("The model was saved, and the script will now exit.")
+                return -1
             except Exception as e:
                 print(f"An unexpected error occurred while closing the environment: {e}")
+                return -1
         print("Cleanup complete.")
 
     print("Script execution finished.")
+
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
