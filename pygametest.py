@@ -10,6 +10,56 @@ import pygame
 import sys
 import enum
 
+def obs_to_state(obs: NDArray[np.int32], grid_size: int) -> int:
+    """Maps a 6D observation to a unique integer state ID."""
+    # Example: [px, py, gx, gy, dx, dy] → index
+    pos = 0
+    for i, val in enumerate(obs):
+        pos += val * (grid_size ** i)
+    return pos
+
+def train_q_learning(episodes=5000, alpha=0.1, gamma=0.99, epsilon=1.0, epsilon_decay=0.999, min_epsilon=0.1, grid_size=5) -> NDArray[np.float64]:
+    env = GridWorldEnv(render_mode=None, grid_size=grid_size)
+    assert isinstance(env.action_space, gym.spaces.Discrete)
+    action_size = env.action_space.n
+
+    # Total possible discrete states: grid_size^6
+    state_space_size = grid_size ** 6
+    q_table = np.zeros((state_space_size, action_size))
+
+    for ep in range(episodes):
+        obs, _ = env.reset()
+        state = obs_to_state(obs, grid_size)
+        done = False
+        total_reward = 0
+
+        while not done:
+            if np.random.rand() < epsilon:
+                action = np.random.randint(action_size)
+            else:
+                action = np.argmax(q_table[state])
+
+            obs, reward, terminated, _, _ = env.step(Action(action + 1))  # Action enum starts at 1
+            next_state = obs_to_state(obs, grid_size)
+
+            # Q-learning update
+            q_table[state, action] += alpha * (
+                reward + gamma * np.max(q_table[next_state]) - q_table[state, action]
+            )
+
+            state = next_state
+            total_reward += reward
+            done = terminated
+
+        epsilon = max(min_epsilon, epsilon * epsilon_decay)
+
+        if (ep + 1) % 500 == 0:
+            print(f"Episode {ep+1}, Epsilon: {epsilon:.3f}, Total reward: {total_reward:.2f}")
+
+    print("Training completed.")
+    return q_table
+
+
 class EventTag(int, enum.Enum):
     UP = enum.auto()
     DOWN = enum.auto()
@@ -121,6 +171,7 @@ class GridWorldEnv(gym.Env):
         raise RuntimeError("_rand_pos aborted after 100 retries")
 
     def step(self, action: Action):
+        old_pos = self._player_pos.copy()
         if action == Action.UP and self._player_pos[1] > 0:  # up
             self._player_pos[1] -= 1
         elif action == Action.DOWN and self._player_pos[1] < self.grid_size - 1:  # down
@@ -135,6 +186,8 @@ class GridWorldEnv(gym.Env):
         terminated = win or lose
         if terminated:
             reward = 1 if win else -1
+        elif np.array_equal(old_pos, self._player_pos):
+            reward = -0.02
         else:
             reward = -0.01
         return self._get_obs(), reward, terminated, False, {}
@@ -192,18 +245,41 @@ class GridWorldEnv(gym.Env):
             pygame.quit()
             self.window = None
 
+def run_policy(env: GridWorldEnv, q_table: NDArray, grid_size: int):
+    obs, _ = env.reset()
+    state = obs_to_state(obs, grid_size)
+    total_reward = 0
+    done = False
+
+    while not done:
+        env.render()
+        action = Action(int(np.argmax(q_table[state])))
+        obs, reward, terminated, _, _ = env.step(action)
+        print(f"Act({action}) -> Obs({obs}) = ${reward}")
+        state = obs_to_state(obs, grid_size)
+        total_reward += reward
+        done = terminated
+
+    print(f"Evaluation complete, total reward: {total_reward:.2f}")
 
 # Manual test loop
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("input", choices=["pygame", "random"], default="random")
+    parser.add_argument("input", choices=["pygame", "random", "train"], default="random")
+    parser.add_argument("--grid-size", default=5, type=int)
+    parser.add_argument("--episodes", default=5000, type=int)
     args = parser.parse_args()
 
     pygame.init()
 
     env = GridWorldEnv(render_mode="human")
     obs, info = env.reset()
-    if args.input == "pygame":
+    if args.input == "train":
+        q_table = train_q_learning(episodes=args.episodes, grid_size=args.grid_size)
+        env = GridWorldEnv(render_mode="human", grid_size=args.grid_size)
+        run_policy(env, q_table, grid_size=args.grid_size)
+        return
+    elif args.input == "pygame":
         event_getter = PygameEventGetter()
     else:
         event_getter = RandomEventGetter()
